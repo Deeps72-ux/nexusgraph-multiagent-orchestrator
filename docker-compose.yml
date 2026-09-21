@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  nexusgraph:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexusgraph-orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=sqlite:///./nexusgraph.db
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - ./nexusgraph.db:/app/nexusgraph.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
