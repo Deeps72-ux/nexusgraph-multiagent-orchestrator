@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # LLM Providers (Optional - fallback rule/agent synthesizer active if not provided)
     GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
     OPENAI_API_KEY: Optional[str] = None
 
     # CORS

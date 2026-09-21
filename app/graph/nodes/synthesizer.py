@@ -1,6 +1,39 @@
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from app.graph.state import GraphState, create_step
+from app.core.config import settings
+from app.graph.nodes.validator import validate_sql_query, validate_python_code
+
+
+def call_groq_llm(prompt: str, system_prompt: str) -> Optional[str]:
+    """Optional Groq LLM inference invocation with silent fallback."""
+    api_key = settings.GROQ_API_KEY
+    if not api_key:
+        return None
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=600
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Remove markdown fences if model included them
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+        return raw
+    except Exception:
+        return None
 
 
 def synthesizer_node(state: GraphState) -> GraphState:
@@ -8,6 +41,7 @@ def synthesizer_node(state: GraphState) -> GraphState:
     Synthesizer Sub-Agent:
     Generates code or queries to accomplish the active sub-goal.
     Applies self-healing corrections if resolving an error trace.
+    Supports Groq inference when GROQ_API_KEY is configured.
     """
     task = state.get("task", "")
     plan = state.get("plan", [])
@@ -33,13 +67,15 @@ def synthesizer_node(state: GraphState) -> GraphState:
     description = ""
     thought = ""
 
-    # Check if this is a healing recovery cycle
+    # Check if this task is an explicit self-healing / syntax repair test
+    is_healing_test = any(k in task_lower for k in ["heal", "syntax", "broken", "intentional error", "intentional syntax"])
+
+    # 1. Healing recovery cycle
     if is_recovering:
         latest_fix = healing_history[-1]
         thought = f"Synthesizing corrected artifact incorporating healing diagnosis: {latest_fix.get('fix_applied')}"
 
         if artifact_type == "python":
-            # Repaired python code
             content = (
                 "def process_data(items):\n"
                 "    \"\"\"Processed dataset metrics after automated self-healing.\"\"\"\n"
@@ -67,9 +103,8 @@ def synthesizer_node(state: GraphState) -> GraphState:
             content = "https://api.nexusgraph.internal/v1/rates"
             description = "Corrected verified REST API endpoint URL."
 
-    # Intentional error test mode for self-healing demonstration
-    elif ("heal" in task_lower or "syntax" in task_lower or "broken" in task_lower or "intentional error" in task_lower) and retry_count == 0 and step_idx == 1:
-        # Deliberately emit syntax error (missing colon) to activate validator AST catch and self-healing loop
+    # 2. Intentional error test mode for self-healing demonstration
+    elif is_healing_test and len(healing_history) == 0 and step_idx == 1:
         artifact_type = "python"
         content = (
             "def process_data(items)\n"  # Missing colon -> SyntaxError for AST
@@ -77,22 +112,34 @@ def synthesizer_node(state: GraphState) -> GraphState:
             "    return [x * 1.15 for x in items]\n"
         )
         description = "Candidate Python script (containing unclosed definition to test AST validation & self-healing)."
-        thought = "Generated initial candidate code. Note: Deliberately testing AST validation catch for automated healing."
+        thought = "Generated candidate code with deliberate syntax test to verify AST validation catch and self-healing."
 
-    # Standard SQL Synthesis
+    # 3. SQL Synthesis
     elif artifact_type == "sql":
-        if "customer" in task_lower or "spend" in task_lower or "transaction" in task_lower:
-            content = (
-                "SELECT c.name, c.plan, c.country, "
-                "COUNT(t.id) AS total_transactions, "
-                "ROUND(COALESCE(SUM(t.amount), 0), 2) AS total_spent, "
-                "ROUND(COALESCE(AVG(t.amount), 0), 2) AS avg_transaction "
-                "FROM customers c "
-                "LEFT JOIN transactions t ON c.id = t.customer_id "
-                "GROUP BY c.id, c.name, c.plan, c.country "
-                "ORDER BY total_spent DESC;"
+        llm_sql = None
+        if settings.GROQ_API_KEY and not is_healing_test:
+            sql_prompt = (
+                f"Task: {task}\n"
+                f"Subgoal: {current_subgoal}\n"
+                "Target Engine: SQLite 3 database.\n"
+                "Available tables and columns:\n"
+                "- customers (id, name, email, plan, country, created_at)\n"
+                "- transactions (id, customer_id, amount, status, category, created_at)\n"
+                "- products (id, name, category, price, stock)\n"
+                "- system_metrics (id, service, cpu_pct, memory_mb, latency_ms, recorded_at)\n"
+                "Write a complete, single read-only SQL SELECT query that answers this objective.\n"
+                "Do NOT use INFORMATION_SCHEMA. Do NOT end with UNION ALL or unfinished clauses. Output only SQL."
             )
-            description = "SQL analytical query aggregating customer transactions, total spend, and average spend."
+            candidate = call_groq_llm(sql_prompt, "You are an expert SQLite query generator. Output strictly a single SELECT query without markdown.")
+            if candidate and candidate.upper().startswith("SELECT"):
+                # Test query validity before committing
+                check = validate_sql_query(candidate)
+                if check["is_valid"]:
+                    llm_sql = candidate
+
+        if llm_sql:
+            content = llm_sql
+            description = f"SQL analytical query generated via Groq ({settings.GROQ_MODEL})."
         elif "metric" in task_lower or "system" in task_lower:
             content = (
                 "SELECT service, ROUND(AVG(cpu_pct), 2) as avg_cpu, "
@@ -104,35 +151,62 @@ def synthesizer_node(state: GraphState) -> GraphState:
             )
             description = "SQL query aggregating system telemetry performance metrics."
         else:
-            content = "SELECT * FROM customers LIMIT 5;"
-            description = "Baseline customer records query."
+            content = (
+                "SELECT c.name, c.plan, c.country, "
+                "COUNT(t.id) AS total_transactions, "
+                "ROUND(COALESCE(SUM(t.amount), 0), 2) AS total_spent, "
+                "ROUND(COALESCE(AVG(t.amount), 0), 2) AS avg_transaction "
+                "FROM customers c "
+                "LEFT JOIN transactions t ON c.id = t.customer_id "
+                "GROUP BY c.id, c.name, c.plan, c.country "
+                "ORDER BY total_spent DESC;"
+            )
+            description = "SQL analytical query aggregating customer transactions, total spend, and average spend."
 
-        thought = f"Synthesized SQL query targeting SQLite database for subgoal: '{current_subgoal}'."
+        thought = f"Synthesized SQL query for subgoal: '{current_subgoal}'."
 
-    # Standard API Synthesis
+    # 4. API Synthesis
     elif artifact_type == "api":
         content = "https://api.nexusgraph.internal/v1/rates"
         description = "GET request to internal rates telemetry API."
         thought = f"Synthesized REST API request for subgoal: '{current_subgoal}'."
 
-    # Standard Python Synthesis
+    # 5. Standard Python Synthesis
     else:
-        content = (
-            "def calculate_aggregate_analytics(data):\n"
-            "    \"\"\"Compute statistical summary over data series.\"\"\"\n"
-            "    cleaned = [v for v in data if isinstance(v, (int, float))]\n"
-            "    if not cleaned:\n"
-            "        return {'count': 0, 'sum': 0, 'average': 0.0}\n"
-            "    return {\n"
-            "        'count': len(cleaned),\n"
-            "        'sum': round(sum(cleaned), 2),\n"
-            "        'average': round(sum(cleaned) / len(cleaned), 2),\n"
-            "        'max': max(cleaned),\n"
-            "        'min': min(cleaned)\n"
-            "    }\n"
-        )
-        description = "Python numerical aggregation utility."
-        thought = f"Synthesized Python data calculation routine for subgoal: '{current_subgoal}'."
+        llm_py = None
+        if settings.GROQ_API_KEY and not is_healing_test:
+            py_prompt = (
+                f"Task: {task}\n"
+                f"Subgoal: {current_subgoal}\n"
+                "Write clean, safe Python code with standard functions and docstrings. Do NOT import os, sys, or subprocess. Output only valid Python code without markdown."
+            )
+            candidate = call_groq_llm(py_prompt, "You are a Python synthesis sub-agent. Output strictly Python code without markdown.")
+            if candidate:
+                check = validate_python_code(candidate)
+                if check["is_valid"]:
+                    llm_py = candidate
+
+        if llm_py:
+            content = llm_py
+            description = f"Python calculation logic synthesized via Groq ({settings.GROQ_MODEL})."
+        else:
+            content = (
+                "def calculate_aggregate_analytics(data):\n"
+                "    \"\"\"Compute statistical summary over data series.\"\"\"\n"
+                "    cleaned = [v for v in data if isinstance(v, (int, float))]\n"
+                "    if not cleaned:\n"
+                "        return {'count': 0, 'sum': 0, 'average': 0.0}\n"
+                "    return {\n"
+                "        'count': len(cleaned),\n"
+                "        'sum': round(sum(cleaned), 2),\n"
+                "        'average': round(sum(cleaned) / len(cleaned), 2),\n"
+                "        'max': max(cleaned),\n"
+                "        'min': min(cleaned)\n"
+                "    }\n"
+            )
+            description = "Python numerical aggregation utility."
+
+        thought = f"Synthesized Python computational routine for subgoal: '{current_subgoal}'."
 
     artifacts = {
         "step_index": step_idx,
